@@ -121,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
 
             // 3. 他の参加者に通知する。
             // client_id 以外は 1 fill されているのが退出
-            msg[size_of::<ID>()..].clone_from_slice(&[1; size_of::<SendEventBinary>()]);
+            msg[size_of::<ID>()..].clone_from_slice(&[1; size_of::<ReceiveEventBinary>()]);
             let _ = event_tx.send(msg).await;
 
             // TcpStream が終わったので解放
