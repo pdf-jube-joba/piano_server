@@ -14,10 +14,14 @@ pub fn default_s() -> SendEventBinary {
     [0u8; size_of::<SendEventBinary>()]
 }
 
-pub fn join() -> SendEventBinary {
-    [0u8; size_of::<SendEventBinary>()]
+pub fn join(client_id: ID) -> SendEventBinary {
+    let mut msg = [0u8; size_of::<SendEventBinary>()];
+    msg[0..size_of::<ID>()].clone_from_slice(&client_id.to_le_bytes());
+    msg
 }
 
-pub fn disconnect() -> SendEventBinary {
-    [1u8; size_of::<SendEventBinary>()]
+pub fn disconnect(client_id: ID) -> SendEventBinary {
+    let mut msg = [u8::MAX; size_of::<SendEventBinary>()];
+    msg[0..size_of::<ID>()].clone_from_slice(&client_id.to_le_bytes());
+    msg
 }

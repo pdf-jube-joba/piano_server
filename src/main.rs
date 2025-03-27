@@ -1,13 +1,63 @@
-use epiano_vr_server::{
-    default_s, disconnect, join, ReceiveEventBinary, SendEventBinary, ID, SERVER,
-};
+use epiano_vr_server::{disconnect, join, ReceiveEventBinary, SendEventBinary, ID, SERVER};
 use rand::Rng;
 use std::{collections::HashMap, mem::size_of, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
-    sync::{mpsc, Mutex},
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpListener,
+    },
+    sync::{
+        mpsc::{self, Receiver, Sender, UnboundedReceiver},
+        Mutex,
+    },
 };
+
+async fn main_send(
+    mut event_rx: Receiver<SendEventBinary>,
+    clients_for_main: Arc<Mutex<HashMap<ID, mpsc::UnboundedSender<SendEventBinary>>>>,
+) {
+    while let Some(event) = event_rx.recv().await {
+        let clients = clients_for_main.lock().await;
+
+        for (_id, tx) in clients.iter() {
+            if let Err(err) = tx.send(event) {
+                // ここ unwrap() は大丈夫？
+                println!("--main_send: error:{err:?}")
+            }
+        }
+    }
+}
+
+// writer か rx が失敗 => return
+async fn client_write(mut rx: UnboundedReceiver<SendEventBinary>, mut writer: OwnedWriteHalf) {
+    while let Some(event) = rx.recv().await {
+        let res = writer.write_all(&event).await;
+        if res.is_err() {
+            return;
+        }
+    }
+    // clients を取得しておいて、 lock して ドロップするようにすれば、 tx が clients から消えた後に rx がドロップされる => main_send() の tx.send() は unwrap() しても安全！
+    // TODO これをやる？
+}
+
+// read reader が失敗 => return
+async fn client_read(client_id: ID, event_tx: Sender<SendEventBinary>, mut reader: OwnedReadHalf) {
+    let should_not_join = join(client_id);
+    let should_notdisconnect = disconnect(client_id);
+
+    // msg を buffer として確保しておき、 user_id も書き込んでおく。
+    let mut msg = join(client_id);
+
+    while let Ok(_ok) = reader.read_exact(&mut msg[size_of::<ID>()..]).await {
+        // 変なイベントははじく。
+        if msg != should_not_join && msg != should_notdisconnect {
+            // ここの unwrap() は大丈夫？
+            // main_send が動き続けているなら、 event_tx は有効 => main_send が動いている機関の方が client_read が動いている期間より長いので .unwrap() は安全。
+            event_tx.send(msg).await.unwrap();
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -25,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
     println!("Server starts at {SERVER}");
 
     // channel(client -> main)
-    let (event_tx, mut event_rx) = mpsc::channel::<SendEventBinary>(100);
+    let (event_tx, event_rx) = mpsc::channel::<SendEventBinary>(100);
     // channels(main -> client)
     let clients = Arc::new(Mutex::new(HashMap::<
         ID,
@@ -34,15 +84,7 @@ async fn main() -> anyhow::Result<()> {
 
     let clients_for_main = Arc::clone(&clients);
     // main loop (event 中継)
-    tokio::spawn(async move {
-        while let Some(event) = event_rx.recv().await {
-            let clients = clients_for_main.lock().await;
-
-            for (_id, tx) in clients.iter() {
-                let _ = tx.send(event);
-            }
-        }
-    });
+    let _main_handle = tokio::spawn(main_send(event_rx, clients_for_main));
 
     loop {
         let (stream, addr) = listener.accept().await?;
@@ -51,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
         let clients = clients.clone();
 
         // channnel(main -> client)
-        let (tx, mut rx) = mpsc::unbounded_channel::<SendEventBinary>();
+        let (tx, rx) = mpsc::unbounded_channel::<SendEventBinary>();
 
         // channnel(main -> client) を clients に登録する（idをかぶらないように）
         let client_id = {
@@ -72,64 +114,42 @@ async fn main() -> anyhow::Result<()> {
         let event_tx = event_tx.clone();
         // 各 client での読み込み/書き込み処理
         tokio::spawn(async move {
-            // client の stream を読む用の buf だが、そのまま event として送り出したい（使いまわす）。
-            let mut msg = default_s();
-            // 自分の client_id は確定しているので埋めておく。
-            msg[0..size_of::<ID>()].clone_from_slice(&client_id.to_le_bytes());
+            println!("start {client_id}");
+            let (reader, mut writer) = stream.into_split();
 
-            let (mut reader, mut writer) = stream.into_split();
-            // client(stream) -> msg と main -> client(stream) の少なくともどちらかを tokio::spawn(async move {}) に入れる必要がある。
-            // ここでは main -> client(stream) を選んだ（AIのおすすめ）。基本的にはどちらでもよさそう。
+            // 1. まずはつないできた client に id を通知する（かならず待つ）
+            let _ = writer.write_all(&client_id.to_le_bytes()).await;
 
-            // 1. まずは client に id を通知する（かならず待つ）
-            // client_id 以外は 0 fill されているのが Join
-            let _ = writer.write_all(&msg[0..size_of::<ID>()]).await;
+            // 2. 他のクライアントに join の通知をする（これも待つ）
+            let _ = event_tx.send(join(client_id)).await;
 
-            // 2. これは待たなくていいけど、とりあえず .await にしてしまう。
-            let _ = event_tx.send(msg.clone()).await;
+            // クライアントへの書き込み用の処理
+            let write_handle = tokio::spawn(client_write(rx, writer));
 
-            // 書き込み用の処理（非同期に切り出す）
-            // (channel(main -> client)) の msg を受け取って stream に書く。
-            tokio::spawn(async move {
-                while let Some(event) = rx.recv().await {
-                    // println!("W: {client_id}...{}", hex::encode(event));
+            // クライアントからの読み込み用の処理
+            let read_handle = tokio::spawn(client_read(
+                client_id,
+                event_tx.clone(), /* ここで clone をしないと、下の行で event_tx が使えない。 */
+                reader,
+            ));
 
-                    // FIX unwrap
-                    writer.write_all(&event).await.unwrap();
+            // join する
+            tokio::select! {
+                _ = write_handle => {
+                    println!("write end {client_id}");
                 }
-            });
+                _ = read_handle => {
+                    println!("read end {client_id}");
+                }
+            };
 
-            // client(stream) -> msg
-            // stream の read をして msg を main に流す
-            println!("new R: {client_id}");
+            // 3. read か write ができなくなる => TCP が disconnect => 他のクライアントに disconnect を通知する。
+            let _ = event_tx.send(disconnect(client_id)).await;
 
-            loop {
-                match reader.read_exact(&mut msg[size_of::<ID>()..]).await {
-                    Ok(ok) => {
-                        // println!("R: {client_id} with {ok}");
-                        // FIX unwrap
-                        event_tx.send(msg).await.unwrap();
-                    }
-                    Err(err) => {
-                        // println!("R: {client_id} err: {err}");
-                        break;
-                    }
-                };
-            }
-
-            // readerループ終了後
-
-            // 3. 他の参加者に通知する。
-            // client_id 以外は 1 fill されているのが退出
-            msg[size_of::<ID>()..].clone_from_slice(&[1; size_of::<ReceiveEventBinary>()]);
-            let _ = event_tx.send(msg).await;
-
-            // TcpStream が終わったので解放
-            {
-                let mut clients = clients.lock().await;
-                clients.remove(&client_id);
-                println!("free {client_id}")
-            }
+            // 4. TcpStream が終わったので、 client_id に対応する tx を解放する。
+            let mut clients = clients.lock().await;
+            clients.remove(&client_id);
+            println!("free {client_id}")
         });
     }
 }
